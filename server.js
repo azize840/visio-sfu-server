@@ -2,14 +2,14 @@ const mediasoup = require('mediasoup');
 const express = require('express');
 const cors = require('cors');
 const { createServer } = require('http');
-const { Server } = require('ws');
+const { WebSocketServer } = require('ws');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const server = createServer(app);
-const wss = new Server({ server, path: '/ws' });
+const wss = new WebSocketServer({ server, path: '/ws' });
 
 // Configuration Mediasoup
 const mediaCodecs = [
@@ -117,9 +117,9 @@ app.post('/tokens', async (req, res) => {
         const room = rooms.get(room_id);
         const rtpCapabilities = room.router.rtpCapabilities;
 
-        // URL Render.com
+        // URL Render.com avec WebSocket
         const renderUrl = process.env.RENDER_EXTERNAL_URL ||
-                         `https://visiocampus-mediasoup.onrender.com`;
+                         `https://visio-sfu-server.onrender.com`;
 
         res.json({
             success: true,
@@ -148,6 +148,31 @@ app.post('/tokens', async (req, res) => {
     }
 });
 
+// Gestion des WebSockets
+wss.on('connection', (ws, request) => {
+    console.log('✅ Nouvelle connexion WebSocket Render');
+
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log('📨 Message WebSocket:', data.action);
+
+            // Répondre pour confirmer la connexion
+            ws.send(JSON.stringify({
+                action: 'connected',
+                message: 'WebSocket SFU ready'
+            }));
+
+        } catch (error) {
+            console.error('❌ Erreur WebSocket:', error);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('🔌 Connexion WebSocket fermée');
+    });
+});
+
 // Nettoyage automatique
 setInterval(() => {
     const now = new Date();
@@ -161,20 +186,6 @@ setInterval(() => {
     }
 }, 5 * 60 * 1000);
 
-// WebSocket
-wss.on('connection', (ws) => {
-    console.log('✅ Nouvelle connexion WebSocket Render');
-
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            console.log('📨 Message WebSocket:', data.action);
-        } catch (error) {
-            console.error('❌ Erreur WebSocket:', error);
-        }
-    });
-});
-
 // Démarrer le serveur
 async function startServer() {
     try {
@@ -185,6 +196,7 @@ async function startServer() {
             console.log('='.repeat(50));
             console.log('🚀 VISIOCAMPUS MEDIASOUP - RENDER.COM');
             console.log(`📡 Port: ${PORT}`);
+            console.log('🔌 WebSockets: ACTIVÉS');
             console.log('💰 Free Tier: 750 heures/mois');
             console.log('💳 Carte crédit: NON REQUISE');
             console.log('='.repeat(50));
