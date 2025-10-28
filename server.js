@@ -77,13 +77,10 @@ async function createWorker() {
     worker = await mediasoup.createWorker({
         logLevel: 'warn',
         rtcMinPort: 40000,
-        rtcMaxPort: 50000,
-        // Configuration pour environnement cloud
-        dtlsCertificateFile: process.env.DTLS_CERT_FILE,
-        dtlsPrivateKeyFile: process.env.DTLS_KEY_FILE
+        rtcMaxPort: 50000
     });
 
-    console.log('✅ Worker Mediasoup créé sur Fly.io');
+    console.log('✅ Worker Mediasoup créé sur Render.com');
 
     worker.on('died', () => {
         console.error('❌ Mediasoup worker died');
@@ -103,8 +100,8 @@ app.get('/health', (req, res) => {
     res.json({
         status: 'ok',
         server: 'visiocampus-mediasoup',
-        provider: 'Fly.io Free Tier',
-        hours_free: 'jusqu\'à 3 VMs gratuites',
+        provider: 'Render.com Free Tier',
+        hours_free: '750 heures/mois gratuites',
         cost: '0€',
         timestamp: new Date().toISOString(),
         rooms_count: rooms.size,
@@ -115,15 +112,14 @@ app.get('/health', (req, res) => {
 
 // Route pour infos réseau
 app.get('/network-info', (req, res) => {
+    const renderUrl = process.env.RENDER_EXTERNAL_URL || 'https://visiocampus-mediasoup.onrender.com';
+
     res.json({
-        server_url: process.env.FLY_APP_NAME ?
-            `https://${process.env.FLY_APP_NAME}.fly.dev` :
-            'http://localhost:3001',
-        websocket_url: process.env.FLY_APP_NAME ?
-            `wss://${process.env.FLY_APP_NAME}.fly.dev/ws` :
-            'ws://localhost:3001/ws',
-        external_url: process.env.FLY_APP_NAME,
-        timestamp: new Date().toISOString()
+        server_url: renderUrl,
+        websocket_url: renderUrl.replace('https', 'wss') + '/ws',
+        external_url: process.env.RENDER_EXTERNAL_URL,
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development'
     });
 });
 
@@ -209,14 +205,9 @@ app.post('/tokens', async (req, res) => {
 
         const rtpCapabilities = room.router.rtpCapabilities;
 
-        // URL Fly.io avec WebSocket sécurisé
-        const flyUrl = process.env.FLY_APP_NAME ?
-            `https://${process.env.FLY_APP_NAME}.fly.dev` :
-            'http://localhost:3001';
-
-        const websocketUrl = process.env.FLY_APP_NAME ?
-            `wss://${process.env.FLY_APP_NAME}.fly.dev/ws` :
-            'ws://localhost:3001/ws';
+        // URL Render.com avec WebSocket sécurisé
+        const renderUrl = process.env.RENDER_EXTERNAL_URL || 'https://visiocampus-mediasoup.onrender.com';
+        const websocketUrl = renderUrl.replace('https', 'wss') + '/ws';
 
         res.json({
             success: true,
@@ -233,7 +224,7 @@ app.post('/tokens', async (req, res) => {
                     ]
                 }
             ],
-            provider: 'Fly.io',
+            provider: 'Render.com',
             max_participants: room.maxParticipants,
             current_participants: room.participants.size
         });
@@ -290,14 +281,17 @@ wss.on('connection', (ws, request) => {
                     request.socket.remoteAddress;
 
     console.log(`✅ Nouvelle connexion WebSocket depuis: ${clientIp}`);
-    console.log(`📡 Headers:`, request.headers);
+    console.log(`🌐 Origin: ${request.headers.origin}`);
 
     // Envoyer un message de bienvenue
     ws.send(JSON.stringify({
         action: 'connected',
         message: 'Connexion SFU établie',
-        server: 'Fly.io Mediasoup',
-        timestamp: new Date().toISOString()
+        server: 'Render.com Mediasoup',
+        timestamp: new Date().toISOString(),
+        websocket_url: process.env.RENDER_EXTERNAL_URL ?
+            process.env.RENDER_EXTERNAL_URL.replace('https', 'wss') + '/ws' :
+            'wss://visiocampus-mediasoup.onrender.com/ws'
     }));
 
     ws.on('message', async (message) => {
@@ -350,24 +344,24 @@ async function startServer() {
         await createWorker();
 
         const PORT = process.env.PORT || 3001;
-        const HOST = process.env.FLY_APP_NAME ? '0.0.0.0' : 'localhost';
+        const HOST = '0.0.0.0'; // Important pour Render.com
 
         server.listen(PORT, HOST, () => {
             console.log('='.repeat(60));
-            console.log('🚀 VISIOCAMPUS MEDIASOUP - FLY.IO');
+            console.log('🚀 VISIOCAMPUS MEDIASOUP - RENDER.COM');
             console.log('='.repeat(60));
             console.log(`📡 Serveur: ${HOST}:${PORT}`);
-            console.log(`🔌 WebSockets: wss://${process.env.FLY_APP_NAME || 'localhost'}.fly.dev/ws`);
+            console.log(`🔌 WebSockets: wss://visiocampus-mediasoup.onrender.com/ws`);
             console.log(`🌍 CORS: Activé pour mobile et ngrok`);
-            console.log(`💰 Free Tier: 3 VMs partagées gratuites`);
-            console.log(`💳 Carte crédit: Requise mais non débitée`);
+            console.log(`💰 Free Tier: 750 heures/mois gratuites`);
+            console.log(`💳 Carte crédit: Non requise`);
             console.log('='.repeat(60));
 
-            if (!process.env.FLY_APP_NAME) {
-                console.log('⚠️  Mode développement local');
-                console.log(`🔗 URL: http://localhost:${PORT}`);
-                console.log(`🔗 WebSocket: ws://localhost:${PORT}/ws`);
-            }
+            console.log('✅ Routes disponibles:');
+            console.log(`   ❤️  Health: https://visiocampus-mediasoup.onrender.com/health`);
+            console.log(`   🌐 Network: https://visiocampus-mediasoup.onrender.com/network-info`);
+            console.log(`   🏠 Rooms: https://visiocampus-mediasoup.onrender.com/rooms/:room_id`);
+            console.log(`   🔗 WebSocket: wss://visiocampus-mediasoup.onrender.com/ws`);
         });
     } catch (error) {
         console.error('❌ Erreur démarrage:', error);
