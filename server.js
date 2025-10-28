@@ -6,16 +6,17 @@ const { WebSocketServer } = require('ws');
 
 const app = express();
 
-// CORS étendu pour mobile et ngrok
+// CORS étendu pour mobile et localtunnel
 app.use(cors({
     origin: [
-        "https://pandurate-squatly-hae.ngrok-free.dev",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        /\.loca\.lt$/,           // ← AJOUT: localtunnel
+        /\.localplayer\.io$/,    // ← AJOUT: localtunnel alternatif
         /\.ngrok-free\.dev$/,
         /\.fly\.dev$/,
         /\.onrender\.com$/
@@ -30,7 +31,6 @@ const server = createServer(app);
 const wss = new WebSocketServer({
     server,
     path: '/ws',
-    // Autoriser toutes les origines pour WebSocket
     verifyClient: (info, callback) => {
         callback(true);
     }
@@ -106,7 +106,8 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         rooms_count: rooms.size,
         room_stats: roomStats,
-        worker: worker ? 'active' : 'inactive'
+        worker: worker ? 'active' : 'inactive',
+        tunnel: 'localtunnel-ready'  // ← AJOUT
     });
 });
 
@@ -119,7 +120,8 @@ app.get('/network-info', (req, res) => {
         websocket_url: renderUrl.replace('https', 'wss') + '/ws',
         external_url: process.env.RENDER_EXTERNAL_URL,
         timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development'
+        environment: process.env.NODE_ENV || 'development',
+        tunnel_support: 'localtunnel'  // ← AJOUT
     });
 });
 
@@ -289,9 +291,7 @@ wss.on('connection', (ws, request) => {
         message: 'Connexion SFU établie',
         server: 'Render.com Mediasoup',
         timestamp: new Date().toISOString(),
-        websocket_url: process.env.RENDER_EXTERNAL_URL ?
-            process.env.RENDER_EXTERNAL_URL.replace('https', 'wss') + '/ws' :
-            'wss://visiocampus-mediasoup.onrender.com/ws'
+        websocket_url: 'wss://visiocampus-mediasoup.onrender.com/ws'
     }));
 
     ws.on('message', async (message) => {
@@ -344,7 +344,7 @@ async function startServer() {
         await createWorker();
 
         const PORT = process.env.PORT || 3001;
-        const HOST = '0.0.0.0'; // Important pour Render.com
+        const HOST = '0.0.0.0';
 
         server.listen(PORT, HOST, () => {
             console.log('='.repeat(60));
@@ -352,7 +352,7 @@ async function startServer() {
             console.log('='.repeat(60));
             console.log(`📡 Serveur: ${HOST}:${PORT}`);
             console.log(`🔌 WebSockets: wss://visiocampus-mediasoup.onrender.com/ws`);
-            console.log(`🌍 CORS: Activé pour mobile et ngrok`);
+            console.log(`🌍 CORS: Activé pour localtunnel et mobile`);
             console.log(`💰 Free Tier: 750 heures/mois gratuites`);
             console.log(`💳 Carte crédit: Non requise`);
             console.log('='.repeat(60));
@@ -362,6 +362,10 @@ async function startServer() {
             console.log(`   🌐 Network: https://visiocampus-mediasoup.onrender.com/network-info`);
             console.log(`   🏠 Rooms: https://visiocampus-mediasoup.onrender.com/rooms/:room_id`);
             console.log(`   🔗 WebSocket: wss://visiocampus-mediasoup.onrender.com/ws`);
+
+            console.log('\n🔧 Pour tester avec localtunnel:');
+            console.log(`   npx localtunnel --port ${PORT}`);
+            console.log('='.repeat(60));
         });
     } catch (error) {
         console.error('❌ Erreur démarrage:', error);
