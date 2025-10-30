@@ -1,3 +1,6 @@
+// server.js - Serveur Mediasoup SFU pour VisioCampus - VERSION RENDER
+require('dotenv').config();
+
 const mediasoup = require('mediasoup');
 const express = require('express');
 const cors = require('cors');
@@ -6,27 +9,40 @@ const { WebSocketServer } = require('ws');
 
 const app = express();
 
-// CORS étendu pour mobile et localtunnel
+// ==================== CONFIGURATION CORS POUR RENDER ====================
 app.use(cors({
-    origin: [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        /\.loca\.lt$/,           // ← AJOUT: localtunnel
-        /\.localplayer\.io$/,    // ← AJOUT: localtunnel alternatif
-        /\.ngrok-free\.dev$/,
-        /\.fly\.dev$/,
-        /\.onrender\.com$/
-    ],
+    origin: function (origin, callback) {
+        // Domaines autorisés en production
+        const allowedOrigins = [
+            'https://votre-app-frontend.onrender.com', // ← REMPLACEZ PAR VOTRE URL RENDER
+            'http://localhost:3000',
+            'http://127.0.0.1:3000',
+            'http://localhost:8000',
+            'http://127.0.0.1:8000',
+            'http://localhost:5173',
+            'http://127.0.0.1:5173'
+        ];
+
+        // En développement, tout autoriser
+        if (process.env.NODE_ENV !== 'production') {
+            return callback(null, true);
+        }
+
+        // En production, vérifier les origines
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.warn('🚨 CORS bloqué pour:', origin);
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 }));
 
 app.use(express.json());
 
+// ==================== SERVEUR HTTP & WEBSOCKET ====================
 const server = createServer(app);
 const wss = new WebSocketServer({
     server,
@@ -36,7 +52,7 @@ const wss = new WebSocketServer({
     }
 });
 
-// Configuration Mediasoup optimisée
+// ==================== CONFIGURATION MEDIASOUP ====================
 const mediaCodecs = [
     {
         kind: 'audio',
@@ -73,24 +89,28 @@ const mediaCodecs = [
 let worker;
 let rooms = new Map();
 
+// ==================== CRÉATION DU WORKER MEDIASOUP ====================
 async function createWorker() {
     worker = await mediasoup.createWorker({
-        logLevel: 'warn',
-        rtcMinPort: 40000,
-        rtcMaxPort: 50000
+        logLevel: process.env.NODE_ENV === 'production' ? 'warn' : 'debug',
+        rtcMinPort: 10000, // ← PORT MIN POUR RENDER
+        rtcMaxPort: 59999, // ← PORT MAX POUR RENDER
+        logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp']
     });
 
-    console.log('✅ Worker Mediasoup créé sur Render.com');
+    console.log('✅ Worker Mediasoup créé');
 
     worker.on('died', () => {
-        console.error('❌ Mediasoup worker died');
+        console.error('❌ Mediasoup worker died - Redémarrage nécessaire');
         process.exit(1);
     });
 
     return worker;
 }
 
-// Health check amélioré
+// ==================== ROUTES API ====================
+
+// Health check OBLIGATOIRE pour Render
 app.get('/health', (req, res) => {
     const roomStats = Array.from(rooms.values()).map(room => ({
         participants: room.participants.size,
@@ -99,33 +119,28 @@ app.get('/health', (req, res) => {
 
     res.json({
         status: 'ok',
-        server: 'visiocampus-mediasoup',
-        provider: 'Render.com Free Tier',
-        hours_free: '750 heures/mois gratuites',
-        cost: '0€',
+        server: 'VisioCampus Mediasoup SFU - Render',
+        environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString(),
         rooms_count: rooms.size,
         room_stats: roomStats,
-        worker: worker ? 'active' : 'inactive',
-        tunnel: 'localtunnel-ready'  // ← AJOUT
+        worker: worker ? 'active' : 'inactive'
     });
 });
 
-// Route pour infos réseau
+// Route pour infos réseau (ADAPTÉ POUR RENDER)
 app.get('/network-info', (req, res) => {
-    const renderUrl = process.env.RENDER_EXTERNAL_URL || 'https://visiocampus-mediasoup.onrender.com';
+    const serverUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3001}`;
 
     res.json({
-        server_url: renderUrl,
-        websocket_url: renderUrl.replace('https', 'wss') + '/ws',
-        external_url: process.env.RENDER_EXTERNAL_URL,
+        server_url: serverUrl,
+        websocket_url: serverUrl.replace('http', 'ws') + '/ws',
         timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development',
-        tunnel_support: 'localtunnel'  // ← AJOUT
+        environment: process.env.NODE_ENV || 'development'
     });
 });
 
-// Créer une room SFU
+// Créer une room SFU (GARDÉ TEL QUEL)
 app.post('/rooms', async (req, res) => {
     try {
         const { room_id, max_participants = 50 } = req.body;
@@ -137,6 +152,7 @@ app.post('/rooms', async (req, res) => {
             });
         }
 
+        // Si la room existe déjà
         if (rooms.has(room_id)) {
             const room = rooms.get(room_id);
             return res.json({
@@ -144,10 +160,12 @@ app.post('/rooms', async (req, res) => {
                 room_id,
                 exists: true,
                 participants_count: room.participants.size,
-                max_participants: room.maxParticipants
+                max_participants: room.maxParticipants,
+                rtp_capabilities: room.router.rtpCapabilities
             });
         }
 
+        // Créer un nouveau router
         const router = await worker.createRouter({ mediaCodecs });
 
         rooms.set(room_id, {
@@ -176,7 +194,7 @@ app.post('/rooms', async (req, res) => {
     }
 });
 
-// Générer token participant
+// Générer token participant (GARDÉ TEL QUEL)
 app.post('/tokens', async (req, res) => {
     try {
         const { room_id, participant_id } = req.body;
@@ -206,10 +224,8 @@ app.post('/tokens', async (req, res) => {
         }
 
         const rtpCapabilities = room.router.rtpCapabilities;
-
-        // URL Render.com avec WebSocket sécurisé
-        const renderUrl = process.env.RENDER_EXTERNAL_URL || 'https://visiocampus-mediasoup.onrender.com';
-        const websocketUrl = renderUrl.replace('https', 'wss') + '/ws';
+        const serverUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3001}`;
+        const websocketUrl = serverUrl.replace('http', 'ws') + '/ws';
 
         res.json({
             success: true,
@@ -226,7 +242,6 @@ app.post('/tokens', async (req, res) => {
                     ]
                 }
             ],
-            provider: 'Render.com',
             max_participants: room.maxParticipants,
             current_participants: room.participants.size
         });
@@ -240,7 +255,7 @@ app.post('/tokens', async (req, res) => {
     }
 });
 
-// Obtenir les stats d'une room
+// Obtenir les stats d'une room (GARDÉ TEL QUEL)
 app.get('/rooms/:room_id', (req, res) => {
     try {
         const { room_id } = req.params;
@@ -277,21 +292,18 @@ app.get('/rooms/:room_id', (req, res) => {
     }
 });
 
-// Gestion des WebSockets améliorée
+// ==================== GESTION DES WEBSOCKETS ====================
 wss.on('connection', (ws, request) => {
-    const clientIp = request.headers['x-forwarded-for'] ||
-                    request.socket.remoteAddress;
+    const clientIp = request.socket.remoteAddress;
 
     console.log(`✅ Nouvelle connexion WebSocket depuis: ${clientIp}`);
-    console.log(`🌐 Origin: ${request.headers.origin}`);
 
-    // Envoyer un message de bienvenue
+    // Message de bienvenue
     ws.send(JSON.stringify({
         action: 'connected',
         message: 'Connexion SFU établie',
-        server: 'Render.com Mediasoup',
-        timestamp: new Date().toISOString(),
-        websocket_url: 'wss://visiocampus-mediasoup.onrender.com/ws'
+        server: 'VisioCampus Mediasoup - Render',
+        timestamp: new Date().toISOString()
     }));
 
     ws.on('message', async (message) => {
@@ -299,7 +311,7 @@ wss.on('connection', (ws, request) => {
             const data = JSON.parse(message);
             console.log('📨 Message WebSocket:', data.action);
 
-            // Répondre systématiquement
+            // Accusé de réception
             ws.send(JSON.stringify({
                 action: 'ack',
                 original_action: data.action,
@@ -325,7 +337,7 @@ wss.on('connection', (ws, request) => {
     });
 });
 
-// Nettoyage automatique des rooms inactives
+// ==================== NETTOYAGE AUTOMATIQUE DES ROOMS ====================
 setInterval(() => {
     const now = new Date();
     const inactiveTime = 30 * 60 * 1000; // 30 minutes
@@ -336,35 +348,32 @@ setInterval(() => {
             console.log(`🧹 Room nettoyée: ${roomId}`);
         }
     }
-}, 5 * 60 * 1000); // Toutes les 5 minutes
+}, 5 * 60 * 1000); // Vérification toutes les 5 minutes
 
-// Démarrer le serveur
+// ==================== DÉMARRAGE DU SERVEUR (ADAPTÉ POUR RENDER) ====================
 async function startServer() {
     try {
         await createWorker();
 
-        const PORT = process.env.PORT || 3001;
-        const HOST = '0.0.0.0';
+        const PORT = process.env.PORT || 3001; // ← PORT DYNAMIQUE RENDER
+        const HOST = '0.0.0.0'; // ← OBLIGATOIRE POUR RENDER
 
         server.listen(PORT, HOST, () => {
             console.log('='.repeat(60));
-            console.log('🚀 VISIOCAMPUS MEDIASOUP - RENDER.COM');
+            console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - RENDER');
             console.log('='.repeat(60));
-            console.log(`📡 Serveur: ${HOST}:${PORT}`);
-            console.log(`🔌 WebSockets: wss://visiocampus-mediasoup.onrender.com/ws`);
-            console.log(`🌍 CORS: Activé pour localtunnel et mobile`);
-            console.log(`💰 Free Tier: 750 heures/mois gratuites`);
-            console.log(`💳 Carte crédit: Non requise`);
+            console.log(`📡 Port: ${PORT}`);
+            console.log(`🖥️  Host: ${HOST}`);
+            console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+            console.log(`⚡ WebSocket: ws://0.0.0.0:${PORT}/ws`);
             console.log('='.repeat(60));
-
             console.log('✅ Routes disponibles:');
-            console.log(`   ❤️  Health: https://visiocampus-mediasoup.onrender.com/health`);
-            console.log(`   🌐 Network: https://visiocampus-mediasoup.onrender.com/network-info`);
-            console.log(`   🏠 Rooms: https://visiocampus-mediasoup.onrender.com/rooms/:room_id`);
-            console.log(`   🔗 WebSocket: wss://visiocampus-mediasoup.onrender.com/ws`);
-
-            console.log('\n🔧 Pour tester avec localtunnel:');
-            console.log(`   npx localtunnel --port ${PORT}`);
+            console.log(`   ❤️  Health: /health`);
+            console.log(`   🌐 Network: /network-info`);
+            console.log(`   🏠 Rooms: POST /rooms`);
+            console.log(`   🎫 Tokens: POST /tokens`);
+            console.log('='.repeat(60));
+            console.log(`✅ Serveur Mediasoup prêt sur Render`);
             console.log('='.repeat(60));
         });
     } catch (error) {
@@ -373,31 +382,31 @@ async function startServer() {
     }
 }
 
-// Gestion propre de l'arrêt
-process.on('SIGINT', async () => {
+// ==================== GESTION PROPRE DE L'ARRÊT ====================
+const gracefulShutdown = async () => {
     console.log('\n🛑 Arrêt du serveur Mediasoup...');
 
+    // Fermer le worker Mediasoup
     if (worker) {
         worker.close();
+        console.log('✅ Worker Mediasoup fermé');
     }
 
+    // Fermer le serveur HTTP
     server.close(() => {
-        console.log('✅ Serveur arrêté proprement');
+        console.log('✅ Serveur HTTP fermé');
         process.exit(0);
     });
-});
 
-process.on('SIGTERM', async () => {
-    console.log('\n🛑 Arrêt du serveur (SIGTERM)...');
+    // Force l'arrêt après 10 secondes
+    setTimeout(() => {
+        console.error('⚠️  Arrêt forcé après timeout');
+        process.exit(1);
+    }, 10000);
+};
 
-    if (worker) {
-        worker.close();
-    }
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
 
-    server.close(() => {
-        console.log('✅ Serveur arrêté proprement');
-        process.exit(0);
-    });
-});
-
+// Démarrer le serveur
 startServer();
