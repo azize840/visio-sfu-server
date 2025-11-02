@@ -1,4 +1,3 @@
-// server.js - Serveur Mediasoup SFU pour VisioCampus - VERSION RENDER
 require('dotenv').config();
 
 const mediasoup = require('mediasoup');
@@ -11,31 +10,14 @@ const app = express();
 
 // ==================== CONFIGURATION CORS POUR RENDER ====================
 app.use(cors({
-    origin: function (origin, callback) {
-        // Domaines autorisés en production
-        const allowedOrigins = [
-            'https://votre-app-frontend.onrender.com', // ← REMPLACEZ PAR VOTRE URL RENDER
-            'http://localhost:3000',
-            'http://127.0.0.1:3000',
-            'http://localhost:8000',
-            'http://127.0.0.1:8000',
-            'http://localhost:5173',
-            'http://127.0.0.1:5173'
-        ];
-
-        // En développement, tout autoriser
-        if (process.env.NODE_ENV !== 'production') {
-            return callback(null, true);
-        }
-
-        // En production, vérifier les origines
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            console.warn('🚨 CORS bloqué pour:', origin);
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
+    origin: [
+        'https://pandurate-squatly-hae.ngrok-free.dev',
+        'https://visiocampus-socketio.onrender.com',
+        'https://visio-peerjs-server.onrender.com',
+        'http://localhost:3000',
+        'http://localhost:8000',
+        'http://localhost:5173'
+    ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 }));
@@ -88,13 +70,14 @@ const mediaCodecs = [
 
 let worker;
 let rooms = new Map();
+const connections = new Map();
 
 // ==================== CRÉATION DU WORKER MEDIASOUP ====================
 async function createWorker() {
     worker = await mediasoup.createWorker({
         logLevel: process.env.NODE_ENV === 'production' ? 'warn' : 'debug',
-        rtcMinPort: 10000, // ← PORT MIN POUR RENDER
-        rtcMaxPort: 59999, // ← PORT MAX POUR RENDER
+        rtcMinPort: 10000,
+        rtcMaxPort: 59999,
         logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp']
     });
 
@@ -108,12 +91,308 @@ async function createWorker() {
     return worker;
 }
 
+// ==================== GESTION DES CONNEXIONS WEBSOCKET ====================
+async function handleMediasoupClient(ws, roomId, participantId) {
+    console.log(`🔗 Nouveau client Mediasoup: ${participantId} dans room: ${roomId}`);
+
+    if (!rooms.has(roomId)) {
+        ws.send(JSON.stringify({
+            action: 'error',
+            error: 'Room non trouvée'
+        }));
+        return;
+    }
+
+    const room = rooms.get(roomId);
+    const connectionId = `${roomId}-${participantId}`;
+
+    const connection = {
+        ws,
+        roomId,
+        participantId,
+        transports: new Map(),
+        producers: new Map(),
+        consumers: new Map(),
+        router: room.router
+    };
+
+    connections.set(connectionId, connection);
+
+    // Gestion des messages
+    ws.on('message', async (message) => {
+        try {
+            const data = JSON.parse(message);
+            await handleMediasoupMessage(connection, data);
+        } catch (error) {
+            console.error('❌ Erreur message Mediasoup:', error);
+            ws.send(JSON.stringify({
+                action: 'error',
+                error: error.message
+            }));
+        }
+    });
+
+    // Nettoyage à la déconnexion
+    ws.on('close', () => {
+        console.log(`🔌 Déconnexion Mediasoup: ${participantId}`);
+        cleanupConnection(connectionId, roomId);
+    });
+
+    ws.on('error', (error) => {
+        console.error(`❌ Erreur WebSocket: ${participantId}`, error);
+        cleanupConnection(connectionId, roomId);
+    });
+
+    // Envoyer les capacités RTP
+    ws.send(JSON.stringify({
+        action: 'rtp-capabilities',
+        rtpCapabilities: room.router.rtpCapabilities
+    }));
+}
+
+async function handleMediasoupMessage(connection, data) {
+    const { action } = data;
+    const { ws, router, transports, producers } = connection;
+
+    switch (action) {
+        case 'create-transport':
+            await handleCreateTransport(connection, data);
+            break;
+
+        case 'connect-transport':
+            await handleConnectTransport(connection, data);
+            break;
+
+        case 'produce':
+            await handleProduce(connection, data);
+            break;
+
+        case 'consume':
+            await handleConsume(connection, data);
+            break;
+
+        case 'resume-consumer':
+            await handleResumeConsumer(connection, data);
+            break;
+
+        case 'get-producers':
+            await handleGetProducers(connection, data);
+            break;
+
+        default:
+            console.warn('⚠️ Action inconnue:', action);
+            ws.send(JSON.stringify({
+                action: 'error',
+                error: `Action inconnue: ${action}`
+            }));
+    }
+}
+
+async function handleCreateTransport(connection, data) {
+    const { ws, router, transports, participantId } = connection;
+    const { direction } = data;
+
+    const transport = await router.createWebRtcTransport({
+        listenIps: [
+            {
+                ip: '0.0.0.0',
+                announcedIp: process.env.RENDER_EXTERNAL_URL ?
+                    new URL(process.env.RENDER_EXTERNAL_URL).hostname : '127.0.0.1'
+            }
+        ],
+        enableUdp: true,
+        enableTcp: true,
+        preferUdp: true,
+        initialAvailableOutgoingBitrate: 1000000
+    });
+
+    transports.set(transport.id, transport);
+
+    transport.on('dtlsstatechange', (dtlsState) => {
+        if (dtlsState === 'closed') {
+            transport.close();
+        }
+    });
+
+    transport.on('close', () => {
+        transports.delete(transport.id);
+    });
+
+    ws.send(JSON.stringify({
+        action: 'transport-created',
+        id: transport.id,
+        iceParameters: transport.iceParameters,
+        iceCandidates: transport.iceCandidates,
+        dtlsParameters: transport.dtlsParameters,
+        direction: direction
+    }));
+
+    console.log(`✅ Transport créé: ${transport.id} pour ${participantId} (${direction})`);
+}
+
+async function handleConnectTransport(connection, data) {
+    const { transports } = connection;
+    const { transportId, dtlsParameters } = data;
+
+    const transport = transports.get(transportId);
+    if (!transport) {
+        throw new Error(`Transport non trouvé: ${transportId}`);
+    }
+
+    await transport.connect({ dtlsParameters });
+    console.log(`✅ Transport connecté: ${transportId}`);
+}
+
+async function handleProduce(connection, data) {
+    const { ws, transports, producers, router, participantId, roomId } = connection;
+    const { transportId, kind, rtpParameters } = data;
+
+    const transport = transports.get(transportId);
+    if (!transport) {
+        throw new Error(`Transport non trouvé: ${transportId}`);
+    }
+
+    const producer = await transport.produce({ kind, rtpParameters });
+    producers.set(producer.id, producer);
+
+    // Notifier tous les autres participants dans la room
+    broadcastToRoom(roomId, participantId, {
+        action: 'new-producer',
+        participantId: participantId,
+        producerId: producer.id,
+        kind: kind
+    });
+
+    ws.send(JSON.stringify({
+        action: 'produced',
+        id: producer.id,
+        kind: kind
+    }));
+
+    console.log(`✅ Producer créé: ${producer.id} (${kind}) pour ${participantId}`);
+
+    producer.on('transportclose', () => {
+        producer.close();
+        producers.delete(producer.id);
+    });
+}
+
+async function handleConsume(connection, data) {
+    const { ws, transports, consumers, router, participantId } = connection;
+    const { transportId, producerId, rtpCapabilities } = data;
+
+    if (!router.canConsume({ producerId, rtpCapabilities })) {
+        throw new Error('Cannot consume');
+    }
+
+    const transport = transports.get(transportId);
+    if (!transport) {
+        throw new Error(`Transport non trouvé: ${transportId}`);
+    }
+
+    const consumer = await transport.consume({
+        producerId,
+        rtpCapabilities,
+        paused: true
+    });
+
+    consumers.set(consumer.id, consumer);
+
+    consumer.on('transportclose', () => {
+        consumer.close();
+        consumers.delete(consumer.id);
+    });
+
+    ws.send(JSON.stringify({
+        action: 'consumed',
+        id: consumer.id,
+        producerId: producerId,
+        kind: consumer.kind,
+        rtpParameters: consumer.rtpParameters,
+        type: consumer.type
+    }));
+
+    console.log(`✅ Consumer créé: ${consumer.id} pour ${participantId}`);
+}
+
+async function handleResumeConsumer(connection, data) {
+    const { consumers } = connection;
+    const { consumerId } = data;
+
+    const consumer = consumers.get(consumerId);
+    if (!consumer) {
+        throw new Error(`Consumer non trouvé: ${consumerId}`);
+    }
+
+    await consumer.resume();
+    console.log(`✅ Consumer résumé: ${consumerId}`);
+}
+
+async function handleGetProducers(connection, data) {
+    const { roomId, participantId, ws } = connection;
+    const room = rooms.get(roomId);
+
+    if (!room) {
+        throw new Error('Room non trouvée');
+    }
+
+    // Récupérer tous les producers de la room (sauf ceux du participant actuel)
+    const allProducers = [];
+    for (const [connId, conn] of connections.entries()) {
+        if (conn.roomId === roomId && conn.participantId !== participantId) {
+            for (const producer of conn.producers.values()) {
+                allProducers.push({
+                    participantId: conn.participantId,
+                    producerId: producer.id,
+                    kind: producer.kind
+                });
+            }
+        }
+    }
+
+    ws.send(JSON.stringify({
+        action: 'producers',
+        producers: allProducers
+    }));
+}
+
+function broadcastToRoom(roomId, excludeParticipantId, message) {
+    for (const [connId, conn] of connections.entries()) {
+        if (conn.roomId === roomId && conn.participantId !== excludeParticipantId) {
+            if (conn.ws.readyState === 1) { // WebSocket.OPEN
+                conn.ws.send(JSON.stringify(message));
+            }
+        }
+    }
+}
+
+function cleanupConnection(connectionId, roomId) {
+    const connection = connections.get(connectionId);
+    if (connection) {
+        // Fermer tous les transports
+        for (const transport of connection.transports.values()) {
+            transport.close();
+        }
+
+        // Notifier les autres participants
+        broadcastToRoom(roomId, connection.participantId, {
+            action: 'participant-left',
+            participantId: connection.participantId
+        });
+
+        connections.delete(connectionId);
+        console.log(`🧹 Connexion nettoyée: ${connectionId}`);
+    }
+}
+
 // ==================== ROUTES API ====================
 
 // Health check OBLIGATOIRE pour Render
 app.get('/health', (req, res) => {
     const roomStats = Array.from(rooms.values()).map(room => ({
-        participants: room.participants.size,
+        roomId: room.roomId,
+        participants: Array.from(connections.entries())
+            .filter(([id, conn]) => conn.roomId === room.roomId).length,
         createdAt: room.createdAt
     }));
 
@@ -123,12 +402,13 @@ app.get('/health', (req, res) => {
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString(),
         rooms_count: rooms.size,
+        connections_count: connections.size,
         room_stats: roomStats,
         worker: worker ? 'active' : 'inactive'
     });
 });
 
-// Route pour infos réseau (ADAPTÉ POUR RENDER)
+// Route pour infos réseau
 app.get('/network-info', (req, res) => {
     const serverUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3001}`;
 
@@ -140,7 +420,7 @@ app.get('/network-info', (req, res) => {
     });
 });
 
-// Créer une room SFU (GARDÉ TEL QUEL)
+// Créer une room SFU
 app.post('/rooms', async (req, res) => {
     try {
         const { room_id, max_participants = 50 } = req.body;
@@ -159,7 +439,8 @@ app.post('/rooms', async (req, res) => {
                 success: true,
                 room_id,
                 exists: true,
-                participants_count: room.participants.size,
+                participants_count: Array.from(connections.entries())
+                    .filter(([id, conn]) => conn.roomId === room_id).length,
                 max_participants: room.maxParticipants,
                 rtp_capabilities: room.router.rtpCapabilities
             });
@@ -170,7 +451,7 @@ app.post('/rooms', async (req, res) => {
 
         rooms.set(room_id, {
             router,
-            participants: new Map(),
+            roomId: room_id,
             createdAt: new Date(),
             maxParticipants: max_participants
         });
@@ -194,7 +475,7 @@ app.post('/rooms', async (req, res) => {
     }
 });
 
-// Générer token participant (GARDÉ TEL QUEL)
+// Générer token participant
 app.post('/tokens', async (req, res) => {
     try {
         const { room_id, participant_id } = req.body;
@@ -214,9 +495,11 @@ app.post('/tokens', async (req, res) => {
         }
 
         const room = rooms.get(room_id);
+        const participantsCount = Array.from(connections.entries())
+            .filter(([id, conn]) => conn.roomId === room_id).length;
 
         // Vérifier si la room n'est pas pleine
-        if (room.participants.size >= room.maxParticipants) {
+        if (participantsCount >= room.maxParticipants) {
             return res.status(429).json({
                 success: false,
                 error: 'Room pleine'
@@ -243,7 +526,7 @@ app.post('/tokens', async (req, res) => {
                 }
             ],
             max_participants: room.maxParticipants,
-            current_participants: room.participants.size
+            current_participants: participantsCount
         });
 
     } catch (error) {
@@ -255,7 +538,7 @@ app.post('/tokens', async (req, res) => {
     }
 });
 
-// Obtenir les stats d'une room (GARDÉ TEL QUEL)
+// Obtenir les stats d'une room
 app.get('/rooms/:room_id', (req, res) => {
     try {
         const { room_id } = req.params;
@@ -268,17 +551,22 @@ app.get('/rooms/:room_id', (req, res) => {
         }
 
         const room = rooms.get(room_id);
-        const participants = Array.from(room.participants.values()).map(p => ({
-            id: p.id,
-            joinedAt: p.joinedAt,
-            transports: p.transports ? p.transports.size : 0
+        const roomConnections = Array.from(connections.entries())
+            .filter(([id, conn]) => conn.roomId === room_id);
+
+        const participants = roomConnections.map(([id, conn]) => ({
+            id: conn.participantId,
+            joinedAt: conn.joinedAt,
+            transports: conn.transports.size,
+            producers: conn.producers.size,
+            consumers: conn.consumers.size
         }));
 
         res.json({
             success: true,
             room_id,
             created_at: room.createdAt,
-            participants_count: room.participants.size,
+            participants_count: participants.length,
             max_participants: room.maxParticipants,
             participants: participants
         });
@@ -295,68 +583,58 @@ app.get('/rooms/:room_id', (req, res) => {
 // ==================== GESTION DES WEBSOCKETS ====================
 wss.on('connection', (ws, request) => {
     const clientIp = request.socket.remoteAddress;
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    const roomId = url.searchParams.get('roomId');
+    const participantId = url.searchParams.get('participantId');
 
-    console.log(`✅ Nouvelle connexion WebSocket depuis: ${clientIp}`);
+    console.log(`✅ Nouvelle connexion WebSocket depuis: ${clientIp} - Room: ${roomId} - Participant: ${participantId}`);
 
-    // Message de bienvenue
-    ws.send(JSON.stringify({
-        action: 'connected',
-        message: 'Connexion SFU établie',
-        server: 'VisioCampus Mediasoup - Render',
-        timestamp: new Date().toISOString()
-    }));
+    if (!roomId || !participantId) {
+        ws.send(JSON.stringify({
+            action: 'error',
+            error: 'Paramètres roomId et participantId requis'
+        }));
+        ws.close();
+        return;
+    }
 
-    ws.on('message', async (message) => {
-        try {
-            const data = JSON.parse(message);
-            console.log('📨 Message WebSocket:', data.action);
+    if (!rooms.has(roomId)) {
+        ws.send(JSON.stringify({
+            action: 'error',
+            error: 'Room non trouvée'
+        }));
+        ws.close();
+        return;
+    }
 
-            // Accusé de réception
-            ws.send(JSON.stringify({
-                action: 'ack',
-                original_action: data.action,
-                received: true,
-                timestamp: new Date().toISOString()
-            }));
-
-        } catch (error) {
-            console.error('❌ Erreur WebSocket:', error);
-            ws.send(JSON.stringify({
-                action: 'error',
-                error: error.message
-            }));
-        }
-    });
-
-    ws.on('close', (code, reason) => {
-        console.log(`🔌 Connexion WebSocket fermée: ${code} - ${reason}`);
-    });
-
-    ws.on('error', (error) => {
-        console.error('❌ Erreur WebSocket:', error);
-    });
+    handleMediasoupClient(ws, roomId, participantId);
 });
 
-// ==================== NETTOYAGE AUTOMATIQUE DES ROOMS ====================
+// ==================== NETTOYAGE AUTOMATIQUE ====================
 setInterval(() => {
     const now = new Date();
     const inactiveTime = 30 * 60 * 1000; // 30 minutes
 
     for (const [roomId, room] of rooms.entries()) {
-        if (now - room.createdAt > inactiveTime && room.participants.size === 0) {
+        const roomConnections = Array.from(connections.entries())
+            .filter(([id, conn]) => conn.roomId === roomId);
+
+        if (now - room.createdAt > inactiveTime && roomConnections.length === 0) {
+            // Fermer le router
+            room.router.close();
             rooms.delete(roomId);
             console.log(`🧹 Room nettoyée: ${roomId}`);
         }
     }
 }, 5 * 60 * 1000); // Vérification toutes les 5 minutes
 
-// ==================== DÉMARRAGE DU SERVEUR (ADAPTÉ POUR RENDER) ====================
+// ==================== DÉMARRAGE DU SERVEUR ====================
 async function startServer() {
     try {
         await createWorker();
 
-        const PORT = process.env.PORT || 3001; // ← PORT DYNAMIQUE RENDER
-        const HOST = '0.0.0.0'; // ← OBLIGATOIRE POUR RENDER
+        const PORT = process.env.PORT || 3001;
+        const HOST = '0.0.0.0';
 
         server.listen(PORT, HOST, () => {
             console.log('='.repeat(60));
@@ -385,6 +663,11 @@ async function startServer() {
 // ==================== GESTION PROPRE DE L'ARRÊT ====================
 const gracefulShutdown = async () => {
     console.log('\n🛑 Arrêt du serveur Mediasoup...');
+
+    // Fermer toutes les connexions WebSocket
+    for (const [id, connection] of connections.entries()) {
+        connection.ws.close();
+    }
 
     // Fermer le worker Mediasoup
     if (worker) {
