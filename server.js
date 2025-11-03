@@ -114,7 +114,7 @@ async function handleMediasoupClient(ws, roomId, participantId) {
         producers: new Map(),
         consumers: new Map(),
         router: room.router,
-        joinedAt: new Date() // Ajout du timestamp
+        joinedAt: new Date()
     };
 
     connections.set(connectionId, connection);
@@ -275,14 +275,25 @@ async function handleProduce(connection, data) {
         producer.close();
         producers.delete(producer.id);
     });
+
+    // ✅ CORRECTION : Surveiller l'état du producer
+    producer.on('trackended', () => {
+        console.log(`🔚 Track terminée pour producer: ${producer.id}`);
+        broadcastToRoom(roomId, participantId, {
+            action: 'producer-closed',
+            participantId: participantId,
+            producerId: producer.id
+        });
+    });
 }
 
+// ✅ CORRECTION COMPLÈTE : Gestion de la consommation avec tracks
 async function handleConsume(connection, data) {
     const { ws, transports, consumers, router, participantId } = connection;
     const { transportId, producerId, rtpCapabilities } = data;
 
     if (!router.canConsume({ producerId, rtpCapabilities })) {
-        throw new Error('Cannot consume');
+        throw new Error('Cannot consume - RTP capabilities incompatibles');
     }
 
     const transport = transports.get(transportId);
@@ -290,18 +301,24 @@ async function handleConsume(connection, data) {
         throw new Error(`Transport non trouvé: ${transportId}`);
     }
 
+    // ✅ CORRECTION : Créer le consumer sans le mettre en pause
     const consumer = await transport.consume({
         producerId,
         rtpCapabilities,
-        paused: true
+        paused: false // ⚠️ IMPORTANT : Ne pas mettre en pause pour recevoir les données
     });
 
     consumers.set(consumer.id, consumer);
 
-    consumer.on('transportclose', () => {
-        consumer.close();
-        consumers.delete(consumer.id);
-    });
+    // ✅ CORRECTION : Envoyer les informations de track au client
+    const trackInfo = {
+        id: consumer.track.id,
+        kind: consumer.track.kind,
+        enabled: consumer.track.enabled,
+        readyState: consumer.track.readyState,
+        muted: consumer.track.muted,
+        label: consumer.track.label || `remote-${consumer.kind}`
+    };
 
     ws.send(JSON.stringify({
         action: 'consumed',
@@ -309,10 +326,77 @@ async function handleConsume(connection, data) {
         producerId: producerId,
         kind: consumer.kind,
         rtpParameters: consumer.rtpParameters,
-        type: consumer.type
+        type: consumer.type,
+        track: trackInfo, // ✅ ENVOYER LES INFOS DE TRACK
+        participantId: this.getParticipantIdFromProducer(producerId) // Ajouter l'ID du participant
     }));
 
-    console.log(`✅ Consumer créé: ${consumer.id} pour ${participantId}`);
+    console.log(`✅ Consumer créé: ${consumer.id} pour ${participantId}, track: ${trackInfo.id}`);
+
+    // ✅ CORRECTION : Gestion des événements de la track
+    consumer.track.onmute = () => {
+        console.log(`🔇 Track ${consumer.track.id} muted`);
+        ws.send(JSON.stringify({
+            action: 'track-muted',
+            consumerId: consumer.id,
+            kind: consumer.kind
+        }));
+    };
+
+    consumer.track.onunmute = () => {
+        console.log(`🔊 Track ${consumer.track.id} unmuted`);
+        ws.send(JSON.stringify({
+            action: 'track-unmuted',
+            consumerId: consumer.id,
+            kind: consumer.kind
+        }));
+    };
+
+    consumer.track.onended = () => {
+        console.log(`🔚 Track ${consumer.track.id} ended`);
+        ws.send(JSON.stringify({
+            action: 'track-ended',
+            consumerId: consumer.id,
+            kind: consumer.kind
+        }));
+    };
+
+    consumer.on('transportclose', () => {
+        console.log(`🚗 Transport fermé pour consumer: ${consumer.id}`);
+        consumer.close();
+        consumers.delete(consumer.id);
+    });
+
+    consumer.on('producerclose', () => {
+        console.log(`🎬 Producer fermé pour consumer: ${consumer.id}`);
+        ws.send(JSON.stringify({
+            action: 'producer-closed',
+            producerId: producerId,
+            consumerId: consumer.id
+        }));
+        consumer.close();
+        consumers.delete(consumer.id);
+    });
+
+    // ✅ CORRECTION : Résumer immédiatement le consumer
+    try {
+        if (consumer.paused) {
+            await consumer.resume();
+            console.log(`▶️ Consumer résumé: ${consumer.id}`);
+        }
+    } catch (error) {
+        console.error(`❌ Erreur résumption consumer ${consumer.id}:`, error.message);
+    }
+}
+
+// ✅ NOUVELLE MÉTHODE : Trouver le participantId à partir du producerId
+function getParticipantIdFromProducer(producerId) {
+    for (const [connectionId, connection] of connections.entries()) {
+        if (connection.producers.has(producerId)) {
+            return connection.participantId;
+        }
+    }
+    return null;
 }
 
 async function handleResumeConsumer(connection, data) {
@@ -326,6 +410,12 @@ async function handleResumeConsumer(connection, data) {
 
     await consumer.resume();
     console.log(`✅ Consumer résumé: ${consumerId}`);
+
+    // Notifier le client
+    connection.ws.send(JSON.stringify({
+        action: 'consumer-resumed',
+        consumerId: consumerId
+    }));
 }
 
 async function handleGetProducers(connection, data) {
@@ -344,7 +434,8 @@ async function handleGetProducers(connection, data) {
                 allProducers.push({
                     participantId: conn.participantId,
                     producerId: producer.id,
-                    kind: producer.kind
+                    kind: producer.kind,
+                    participantName: `User-${conn.participantId}` // Peut être amélioré
                 });
             }
         }
@@ -354,30 +445,42 @@ async function handleGetProducers(connection, data) {
         action: 'producers',
         producers: allProducers
     }));
+
+    console.log(`📊 ${allProducers.length} producers envoyés à ${participantId}`);
 }
 
 function broadcastToRoom(roomId, excludeParticipantId, message) {
+    let sentCount = 0;
     for (const [connId, conn] of connections.entries()) {
         if (conn.roomId === roomId && conn.participantId !== excludeParticipantId) {
             if (conn.ws.readyState === 1) { // WebSocket.OPEN
                 conn.ws.send(JSON.stringify(message));
+                sentCount++;
             }
         }
     }
+    console.log(`📢 Message ${message.action} diffusé à ${sentCount} participants`);
 }
 
 function cleanupConnection(connectionId, roomId) {
     const connection = connections.get(connectionId);
     if (connection) {
+        const { participantId } = connection;
+
         // Fermer tous les transports
         for (const transport of connection.transports.values()) {
-            transport.close();
+            try {
+                transport.close();
+            } catch (error) {
+                console.error(`❌ Erreur fermeture transport: ${error.message}`);
+            }
         }
 
         // Notifier les autres participants
-        broadcastToRoom(roomId, connection.participantId, {
+        broadcastToRoom(roomId, participantId, {
             action: 'participant-left',
-            participantId: connection.participantId
+            participantId: participantId,
+            reason: 'disconnected'
         });
 
         connections.delete(connectionId);
@@ -391,10 +494,11 @@ function cleanupConnection(connectionId, roomId) {
 app.get('/', (req, res) => {
     res.json({
         status: 'SFU Server Running',
-        service: 'VisioCampus Mediasoup SFU',
+        service: 'VisioCampus Mediasoup SFU - CORRIGÉ',
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'development',
-        version: '1.0.0',
+        version: '2.0.0',
+        features: ['audio', 'video', 'real-time', 'tracks-fixed'],
         routes: {
             health: '/health',
             network: '/network-info',
@@ -416,13 +520,19 @@ app.get('/health', (req, res) => {
 
     res.json({
         status: 'ok',
-        server: 'VisioCampus Mediasoup SFU - Render',
+        server: 'VisioCampus Mediasoup SFU - Render (CORRIGÉ)',
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString(),
         rooms_count: rooms.size,
         connections_count: connections.size,
         room_stats: roomStats,
-        worker: worker ? 'active' : 'inactive'
+        worker: worker ? 'active' : 'inactive',
+        features: {
+            tracks: 'enabled',
+            audio: 'enabled',
+            video: 'enabled',
+            websocket: 'enabled'
+        }
     });
 });
 
@@ -434,7 +544,16 @@ app.get('/network-info', (req, res) => {
         server_url: serverUrl,
         websocket_url: serverUrl.replace('http', 'ws') + '/ws',
         timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development'
+        environment: process.env.NODE_ENV || 'development',
+        ice_servers: [
+            {
+                urls: [
+                    'stun:stun.l.google.com:19302',
+                    'stun:stun1.l.google.com:19302',
+                    'stun:stun2.l.google.com:19302'
+                ]
+            }
+        ]
     });
 });
 
@@ -453,12 +572,14 @@ app.post('/rooms', async (req, res) => {
         // Si la room existe déjà
         if (rooms.has(room_id)) {
             const room = rooms.get(room_id);
+            const participantsCount = Array.from(connections.entries())
+                .filter(([id, conn]) => conn.roomId === room_id).length;
+
             return res.json({
                 success: true,
                 room_id,
                 exists: true,
-                participants_count: Array.from(connections.entries())
-                    .filter(([id, conn]) => conn.roomId === room_id).length,
+                participants_count: participantsCount,
                 max_participants: room.maxParticipants,
                 rtp_capabilities: room.router.rtpCapabilities
             });
@@ -632,17 +753,36 @@ wss.on('connection', (ws, request) => {
 setInterval(() => {
     const now = new Date();
     const inactiveTime = 30 * 60 * 1000; // 30 minutes
+    let cleanedRooms = 0;
+    let cleanedConnections = 0;
 
+    // Nettoyer les connexions orphelines
+    for (const [connectionId, connection] of connections.entries()) {
+        if (now - connection.joinedAt > inactiveTime) {
+            cleanupConnection(connectionId, connection.roomId);
+            cleanedConnections++;
+        }
+    }
+
+    // Nettoyer les rooms vides
     for (const [roomId, room] of rooms.entries()) {
         const roomConnections = Array.from(connections.entries())
             .filter(([id, conn]) => conn.roomId === roomId);
 
-        if (now - room.createdAt > inactiveTime && roomConnections.length === 0) {
-            // Fermer le router
-            room.router.close();
-            rooms.delete(roomId);
-            console.log(`🧹 Room nettoyée: ${roomId}`);
+        if (roomConnections.length === 0 && (now - room.createdAt > inactiveTime)) {
+            try {
+                room.router.close();
+                rooms.delete(roomId);
+                cleanedRooms++;
+                console.log(`🧹 Room nettoyée: ${roomId}`);
+            } catch (error) {
+                console.error(`❌ Erreur nettoyage room ${roomId}:`, error.message);
+            }
         }
+    }
+
+    if (cleanedRooms > 0 || cleanedConnections > 0) {
+        console.log(`🧹 Nettoyage automatique: ${cleanedRooms} rooms, ${cleanedConnections} connexions`);
     }
 }, 5 * 60 * 1000); // Vérification toutes les 5 minutes
 
@@ -651,13 +791,12 @@ async function startServer() {
     try {
         await createWorker();
 
-        // CORRECTION IMPORTANTE : Utiliser process.env.PORT pour Render
         const PORT = process.env.PORT || 3001;
         const HOST = '0.0.0.0';
 
         server.listen(PORT, HOST, () => {
             console.log('='.repeat(80));
-            console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - RENDER');
+            console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - RENDER (CORRIGÉ)');
             console.log('='.repeat(80));
             console.log(`📡 Port: ${PORT}`);
             console.log(`🖥️  Host: ${HOST}`);
@@ -671,7 +810,13 @@ async function startServer() {
             console.log(`   🏠 Rooms: POST /rooms`);
             console.log(`   🎫 Tokens: POST /tokens`);
             console.log('='.repeat(80));
-            console.log(`✅ Serveur Mediasoup prêt sur Render`);
+            console.log('🎯 CORRECTIONS APPLIQUÉES:');
+            console.log(`   ✅ Tracks envoyées aux clients`);
+            console.log(`   ✅ Consumers non mis en pause`);
+            console.log(`   ✅ Gestion des événements tracks`);
+            console.log(`   ✅ Résumption automatique`);
+            console.log('='.repeat(80));
+            console.log(`✅ Serveur Mediasoup PRÊT avec gestion des tracks`);
             console.log(`🔗 URL: https://visio-sfu-server-6.onrender.com`);
             console.log('='.repeat(80));
         });
@@ -685,9 +830,18 @@ async function startServer() {
 const gracefulShutdown = async () => {
     console.log('\n🛑 Arrêt du serveur Mediasoup...');
 
-    // Fermer toutes les connexions WebSocket
+    // Notifier tous les clients
     for (const [id, connection] of connections.entries()) {
-        connection.ws.close();
+        try {
+            connection.ws.send(JSON.stringify({
+                action: 'server-shutdown',
+                message: 'Le serveur va redémarrer',
+                timestamp: Date.now()
+            }));
+            connection.ws.close();
+        } catch (error) {
+            // Ignorer les erreurs de fermeture
+        }
     }
 
     // Fermer le worker Mediasoup
@@ -711,6 +865,15 @@ const gracefulShutdown = async () => {
 
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
+
+// Gestion des erreurs globales
+process.on('uncaughtException', (error) => {
+    console.error('❌ Erreur non gérée:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Promise rejetée:', reason);
+});
 
 // Démarrer le serveur
 startServer();
