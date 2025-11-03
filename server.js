@@ -113,7 +113,8 @@ async function handleMediasoupClient(ws, roomId, participantId) {
         transports: new Map(),
         producers: new Map(),
         consumers: new Map(),
-        router: room.router
+        router: room.router,
+        joinedAt: new Date() // Ajout du timestamp
     };
 
     connections.set(connectionId, connection);
@@ -196,8 +197,7 @@ async function handleCreateTransport(connection, data) {
         listenIps: [
             {
                 ip: '0.0.0.0',
-                announcedIp: process.env.RENDER_EXTERNAL_URL ?
-                    new URL(process.env.RENDER_EXTERNAL_URL).hostname : '127.0.0.1'
+                announcedIp: process.env.RENDER_EXTERNAL_HOSTNAME || '127.0.0.1'
             }
         ],
         enableUdp: true,
@@ -386,6 +386,24 @@ function cleanupConnection(connectionId, roomId) {
 }
 
 // ==================== ROUTES API ====================
+
+// Route racine OBLIGATOIRE pour Render
+app.get('/', (req, res) => {
+    res.json({
+        status: 'SFU Server Running',
+        service: 'VisioCampus Mediasoup SFU',
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development',
+        version: '1.0.0',
+        routes: {
+            health: '/health',
+            network: '/network-info',
+            create_room: 'POST /rooms',
+            create_token: 'POST /tokens',
+            websocket: '/ws'
+        }
+    });
+});
 
 // Health check OBLIGATOIRE pour Render
 app.get('/health', (req, res) => {
@@ -633,26 +651,29 @@ async function startServer() {
     try {
         await createWorker();
 
+        // CORRECTION IMPORTANTE : Utiliser process.env.PORT pour Render
         const PORT = process.env.PORT || 3001;
         const HOST = '0.0.0.0';
 
         server.listen(PORT, HOST, () => {
-            console.log('='.repeat(60));
+            console.log('='.repeat(80));
             console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - RENDER');
-            console.log('='.repeat(60));
+            console.log('='.repeat(80));
             console.log(`📡 Port: ${PORT}`);
             console.log(`🖥️  Host: ${HOST}`);
             console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-            console.log(`⚡ WebSocket: ws://0.0.0.0:${PORT}/ws`);
-            console.log('='.repeat(60));
+            console.log(`⚡ WebSocket: ws://${HOST}:${PORT}/ws`);
+            console.log('='.repeat(80));
             console.log('✅ Routes disponibles:');
+            console.log(`   🏠 Root: /`);
             console.log(`   ❤️  Health: /health`);
             console.log(`   🌐 Network: /network-info`);
             console.log(`   🏠 Rooms: POST /rooms`);
             console.log(`   🎫 Tokens: POST /tokens`);
-            console.log('='.repeat(60));
+            console.log('='.repeat(80));
             console.log(`✅ Serveur Mediasoup prêt sur Render`);
-            console.log('='.repeat(60));
+            console.log(`🔗 URL: https://visio-sfu-server-6.onrender.com`);
+            console.log('='.repeat(80));
         });
     } catch (error) {
         console.error('❌ Erreur démarrage:', error);
