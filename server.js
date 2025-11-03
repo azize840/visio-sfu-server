@@ -9,7 +9,6 @@ const dns = require('dns').promises;
 
 const app = express();
 
-// ==================== CONFIGURATION CORS ====================
 app.use(cors({
     origin: [
         'https://pandurate-squatly-hae.ngrok-free.dev',
@@ -25,27 +24,16 @@ app.use(cors({
 
 app.use(express.json());
 
-// ==================== SERVEUR HTTP & WEBSOCKET ====================
 const server = createServer(app);
 const wss = new WebSocketServer({
     server,
-    path: '/ws',
-    verifyClient: (info, callback) => {
-        callback(true);
-    }
+    path: '/ws'
 });
 
-// ==================== CONFIGURATION STUN/TURN ====================
+// ==================== CONFIGURATION TURN UNIQUEMENT (pas de STUN) ====================
 const ICE_SERVERS = [
     {
-        urls: [
-            'stun:stun.l.google.com:19302',
-            'stun:stun1.l.google.com:19302',
-            'stun:stun2.l.google.com:19302'
-        ]
-    },
-    {
-        urls: 'turn:openrelay.metered.ca:80',
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
         username: 'openrelayproject',
         credential: 'openrelayproject'
     },
@@ -53,44 +41,22 @@ const ICE_SERVERS = [
         urls: 'turn:openrelay.metered.ca:443',
         username: 'openrelayproject',
         credential: 'openrelayproject'
-    },
-    {
-        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-        username: 'openrelayproject',
-        credential: 'openrelayproject'
     }
 ];
 
-// ==================== CONFIGURATION MEDIASOUP ====================
 const mediaCodecs = [
     {
         kind: 'audio',
         mimeType: 'audio/opus',
         clockRate: 48000,
-        channels: 2,
-        parameters: {
-            minptime: 10,
-            useinbandfec: 1
-        }
+        channels: 2
     },
     {
         kind: 'video',
         mimeType: 'video/VP8',
         clockRate: 90000,
         parameters: {
-            'x-google-start-bitrate': 1000,
-            'x-google-max-bitrate': 3000,
-            'x-google-min-bitrate': 400
-        }
-    },
-    {
-        kind: 'video',
-        mimeType: 'video/H264',
-        clockRate: 90000,
-        parameters: {
-            'packetization-mode': 1,
-            'profile-level-id': '42e01f',
-            'level-asymmetry-allowed': 1
+            'x-google-start-bitrate': 1000
         }
     }
 ];
@@ -100,113 +66,73 @@ let rooms = new Map();
 const connections = new Map();
 let cachedPublicIp = null;
 
-// ==================== FONCTION POUR OBTENIR L'IP PUBLIQUE - CORRIGÉE ====================
+// ==================== RÉSOLUTION IP PUBLIQUE ====================
 async function getPublicIp() {
-    // Si déjà en cache, retourner immédiatement
-    if (cachedPublicIp) {
-        return cachedPublicIp;
-    }
+    if (cachedPublicIp) return cachedPublicIp;
 
     try {
-        // Méthode 1: Résoudre le hostname Render en IP
+        // Méthode 1: DNS
         if (process.env.RENDER_EXTERNAL_HOSTNAME) {
-            console.log(`🔍 Résolution DNS de: ${process.env.RENDER_EXTERNAL_HOSTNAME}`);
-
             try {
                 const addresses = await dns.resolve4(process.env.RENDER_EXTERNAL_HOSTNAME);
                 if (addresses && addresses.length > 0) {
                     cachedPublicIp = addresses[0];
-                    console.log(`✅ IP publique résolue: ${cachedPublicIp}`);
+                    console.log(`✅ IP résolue via DNS: ${cachedPublicIp}`);
                     return cachedPublicIp;
                 }
-            } catch (dnsError) {
-                console.warn(`⚠️ Erreur résolution DNS:`, dnsError.message);
-            }
-        }
-
-        // Méthode 2: Utiliser un service externe (fallback)
-        const https = require('https');
-
-        const getIpFromService = (url) => {
-            return new Promise((resolve, reject) => {
-                https.get(url, (res) => {
-                    let data = '';
-                    res.on('data', (chunk) => data += chunk);
-                    res.on('end', () => {
-                        try {
-                            const ip = data.trim();
-                            // Valider le format IP
-                            if (/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
-                                resolve(ip);
-                            } else {
-                                reject(new Error('Format IP invalide'));
-                            }
-                        } catch (e) {
-                            reject(e);
-                        }
-                    });
-                }).on('error', reject);
-            });
-        };
-
-        console.log('🔍 Récupération IP via service externe...');
-
-        // Essayer plusieurs services
-        const services = [
-            'https://api.ipify.org',
-            'https://ifconfig.me/ip',
-            'https://icanhazip.com'
-        ];
-
-        for (const service of services) {
-            try {
-                cachedPublicIp = await getIpFromService(service);
-                console.log(`✅ IP publique obtenue: ${cachedPublicIp} (via ${service})`);
-                return cachedPublicIp;
             } catch (err) {
-                console.warn(`⚠️ Échec ${service}:`, err.message);
+                console.warn(`⚠️ DNS failed: ${err.message}`);
             }
         }
 
-        // Si tout échoue, utiliser 0.0.0.0 (tous les interfaces)
-        console.warn('⚠️ Impossible d\'obtenir l\'IP publique, utilisation de 0.0.0.0');
-        cachedPublicIp = '0.0.0.0';
-        return cachedPublicIp;
+        // Méthode 2: Service externe
+        const https = require('https');
+        const ip = await new Promise((resolve, reject) => {
+            https.get('https://api.ipify.org', (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => resolve(data.trim()));
+            }).on('error', reject);
+        });
 
+        if (/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
+            cachedPublicIp = ip;
+            console.log(`✅ IP via ipify: ${cachedPublicIp}`);
+            return cachedPublicIp;
+        }
     } catch (error) {
-        console.error('❌ Erreur récupération IP:', error);
-        return '0.0.0.0';
+        console.error('❌ Erreur récupération IP:', error.message);
     }
+
+    console.warn('⚠️ Fallback à 0.0.0.0');
+    return '0.0.0.0';
 }
 
-// ==================== CRÉATION DU WORKER MEDIASOUP ====================
+// ==================== WORKER MEDIASOUP ====================
 async function createWorker() {
     worker = await mediasoup.createWorker({
-        logLevel: 'debug', // Plus de logs pour diagnostiquer
-        rtcMinPort: 10000,
-        rtcMaxPort: 10100, // ✅ RÉDUIT pour Render (ports limités)
+        logLevel: 'debug',
+        rtcMinPort: 40000,
+        rtcMaxPort: 40099, // Petit range pour Render
         logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp', 'rtcp']
     });
 
     console.log('✅ Worker Mediasoup créé');
 
     worker.on('died', () => {
-        console.error('❌ Mediasoup worker died - Redémarrage nécessaire');
+        console.error('❌ Worker died');
         process.exit(1);
     });
 
     return worker;
 }
 
-// ==================== GESTION DES CONNEXIONS WEBSOCKET ====================
+// ==================== WEBSOCKET CLIENT ====================
 async function handleMediasoupClient(ws, roomId, participantId) {
-    console.log(`🔗 Nouveau client Mediasoup: ${participantId} dans room: ${roomId}`);
+    console.log(`🔗 Client: ${participantId} → Room: ${roomId}`);
 
     if (!rooms.has(roomId)) {
-        ws.send(JSON.stringify({
-            action: 'error',
-            error: 'Room non trouvée'
-        }));
+        ws.send(JSON.stringify({ action: 'error', error: 'Room non trouvée' }));
         return;
     }
 
@@ -226,32 +152,27 @@ async function handleMediasoupClient(ws, roomId, participantId) {
 
     connections.set(connectionId, connection);
 
-    // Gestion des messages
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message);
             await handleMediasoupMessage(connection, data);
         } catch (error) {
-            console.error('❌ Erreur message Mediasoup:', error);
-            ws.send(JSON.stringify({
-                action: 'error',
-                error: error.message
-            }));
+            console.error('❌ Erreur message:', error);
+            ws.send(JSON.stringify({ action: 'error', error: error.message }));
         }
     });
 
-    // Nettoyage à la déconnexion
     ws.on('close', () => {
-        console.log(`🔌 Déconnexion Mediasoup: ${participantId}`);
+        console.log(`🔌 Déconnexion: ${participantId}`);
         cleanupConnection(connectionId, roomId);
     });
 
     ws.on('error', (error) => {
-        console.error(`❌ Erreur WebSocket: ${participantId}`, error);
+        console.error(`❌ WebSocket error: ${participantId}`, error);
         cleanupConnection(connectionId, roomId);
     });
 
-    // Envoyer les capacités RTP avec ICE servers
+    // Envoyer capacités RTP + ICE servers
     ws.send(JSON.stringify({
         action: 'rtp-capabilities',
         rtpCapabilities: room.router.rtpCapabilities,
@@ -266,86 +187,95 @@ async function handleMediasoupMessage(connection, data) {
         case 'create-transport':
             await handleCreateTransport(connection, data);
             break;
-
         case 'connect-transport':
             await handleConnectTransport(connection, data);
             break;
-
         case 'produce':
             await handleProduce(connection, data);
             break;
-
         case 'consume':
             await handleConsume(connection, data);
             break;
-
         case 'resume-consumer':
             await handleResumeConsumer(connection, data);
             break;
-
         case 'get-producers':
             await handleGetProducers(connection, data);
             break;
-
-        default:
-            console.warn('⚠️ Action inconnue:', action);
     }
 }
 
-// ✅ CRÉATION TRANSPORT AVEC IP PUBLIQUE RÉSOLUE
+// ==================== CRÉATION TRANSPORT - TCP UNIQUEMENT ====================
 async function handleCreateTransport(connection, data) {
     const { ws, router, transports, participantId } = connection;
     const { direction } = data;
 
-    // Obtenir l'IP publique résolue
     const announcedIp = await getPublicIp();
 
-    console.log(`🌐 Création transport ${direction} avec announcedIp: ${announcedIp}`);
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`🚗 Création transport ${direction.toUpperCase()}`);
+    console.log(`👤 Participant: ${participantId}`);
+    console.log(`🌐 IP annoncée: ${announcedIp}`);
+    console.log(`${'='.repeat(80)}`);
 
+    // ⚠️ CRITIQUE: enableUdp = false pour Render
     const transport = await router.createWebRtcTransport({
         listenIps: [
             {
-                ip: '0.0.0.0', // Écouter sur toutes les interfaces
-                announcedIp: announcedIp // ✅ IP publique résolue
+                ip: '0.0.0.0',
+                announcedIp: announcedIp
             }
         ],
-        enableUdp: true,
-        enableTcp: true,
-        preferUdp: true,
-        initialAvailableOutgoingBitrate: 1000000,
-        minimumAvailableOutgoingBitrate: 600000,
-        maxSctpMessageSize: 262144,
-        iceConsentTimeout: 20,
-        enableSctp: true
+        enableUdp: false,  // ✅ DÉSACTIVÉ car Render ne supporte pas UDP range
+        enableTcp: true,   // ✅ ACTIVÉ (TCP uniquement)
+        preferUdp: false,  // ✅ Forcer TCP
+        preferTcp: true,   // ✅ Forcer TCP
+        initialAvailableOutgoingBitrate: 800000,
+        minimumAvailableOutgoingBitrate: 400000,
+        maxSctpMessageSize: 262144
     });
 
     transports.set(transport.id, transport);
 
-    // Logs détaillés pour diagnostic
-    console.log(`📡 Transport ${transport.id} créé:`);
-    console.log(`   - IP annoncée: ${announcedIp}`);
-    console.log(`   - ICE candidates: ${transport.iceCandidates.length}`);
+    // Logs de debug
+    console.log(`📊 ICE Candidates: ${transport.iceCandidates.length}`);
     transport.iceCandidates.forEach((candidate, i) => {
-        console.log(`   - Candidate ${i + 1}: ${candidate.ip}:${candidate.port} (${candidate.protocol})`);
-    });
+        console.log(`   ${i + 1}. ${candidate.protocol.toUpperCase()} ${candidate.ip}:${candidate.port} (type: ${candidate.type})`);
 
-    // Gestion des événements du transport
-    transport.on('dtlsstatechange', (dtlsState) => {
-        console.log(`🔐 DTLS ${transport.id}: ${dtlsState}`);
-        if (dtlsState === 'closed' || dtlsState === 'failed') {
-            console.error(`❌ Transport ${transport.id} DTLS ${dtlsState}`);
+        // Vérifier si IP privée
+        const isPrivate = candidate.ip === '0.0.0.0' ||
+                         candidate.ip === '127.0.0.1' ||
+                         candidate.ip.startsWith('192.168') ||
+                         candidate.ip.startsWith('10.') ||
+                         candidate.ip.startsWith('172.');
+
+        if (isPrivate) {
+            console.error(`      ❌ IP PRIVÉE: ${candidate.ip}`);
+        } else {
+            console.log(`      ✅ IP PUBLIQUE: ${candidate.ip}`);
         }
     });
 
-    transport.on('icestatechange', (iceState) => {
-        console.log(`🧊 ICE ${transport.id}: ${iceState}`);
-        if (iceState === 'disconnected') {
-            console.warn(`⚠️ ICE disconnected pour ${transport.id}`);
-        } else if (iceState === 'failed') {
-            console.error(`❌ ICE failed pour ${transport.id}`);
-        } else if (iceState === 'connected' || iceState === 'completed') {
-            console.log(`✅ ICE ${iceState} pour ${transport.id}`);
+    // Événements transport
+    transport.on('icestatechange', (state) => {
+        console.log(`🧊 [${direction}] ICE state: ${state}`);
+        if (state === 'checking') {
+            console.log(`   → Tentative de connexion ICE en cours...`);
+        } else if (state === 'connected') {
+            console.log(`   ✅ ICE connecté!`);
+        } else if (state === 'failed') {
+            console.error(`   ❌ ICE FAILED - Le transport ne peut pas se connecter`);
         }
+    });
+
+    transport.on('dtlsstatechange', (state) => {
+        console.log(`🔐 [${direction}] DTLS state: ${state}`);
+    });
+
+    transport.on('iceselectedtuplechange', (tuple) => {
+        console.log(`🎯 [${direction}] ICE Selected Tuple:`);
+        console.log(`   Local:  ${tuple.localIp}:${tuple.localPort} (${tuple.protocol})`);
+        console.log(`   Remote: ${tuple.remoteIp}:${tuple.remotePort}`);
     });
 
     transport.on('close', () => {
@@ -364,7 +294,8 @@ async function handleCreateTransport(connection, data) {
         iceServers: ICE_SERVERS
     }));
 
-    console.log(`✅ Transport ${direction} créé: ${transport.id} pour ${participantId}`);
+    console.log(`✅ Transport ${direction} créé et envoyé`);
+    console.log(`${'='.repeat(80)}\n`);
 }
 
 async function handleConnectTransport(connection, data) {
@@ -389,14 +320,9 @@ async function handleProduce(connection, data) {
         throw new Error(`Transport non trouvé: ${transportId}`);
     }
 
-    const producer = await transport.produce({
-        kind,
-        rtpParameters
-    });
-
+    const producer = await transport.produce({ kind, rtpParameters });
     producers.set(producer.id, producer);
 
-    // Notifier les autres participants
     broadcastToRoom(roomId, participantId, {
         action: 'new-producer',
         participantId: participantId,
@@ -410,7 +336,7 @@ async function handleProduce(connection, data) {
         kind: kind
     }));
 
-    console.log(`✅ Producer ${kind} créé: ${producer.id} pour ${participantId}`);
+    console.log(`✅ Producer ${kind}: ${producer.id} (${participantId})`);
 
     producer.on('transportclose', () => {
         producer.close();
@@ -452,7 +378,7 @@ async function handleConsume(connection, data) {
             participantId: producerParticipantId
         }));
 
-        console.log(`✅ Consumer créé: ${consumer.id} (${consumer.kind}) pour ${participantId}`);
+        console.log(`✅ Consumer ${consumer.kind}: ${consumer.id} (${participantId})`);
 
         consumer.on('transportclose', () => {
             consumer.close();
@@ -471,10 +397,7 @@ async function handleConsume(connection, data) {
 
     } catch (error) {
         console.error(`❌ Erreur consume:`, error);
-        ws.send(JSON.stringify({
-            action: 'error',
-            error: error.message
-        }));
+        ws.send(JSON.stringify({ action: 'error', error: error.message }));
     }
 }
 
@@ -497,12 +420,13 @@ async function handleResumeConsumer(connection, data) {
     }
 
     await consumer.resume();
-    console.log(`✅ Consumer résumé: ${consumerId}`);
 
     ws.send(JSON.stringify({
         action: 'consumer-resumed',
         consumerId: consumerId
     }));
+
+    console.log(`✅ Consumer résumé: ${consumerId}`);
 }
 
 async function handleGetProducers(connection, data) {
@@ -528,17 +452,12 @@ async function handleGetProducers(connection, data) {
 }
 
 function broadcastToRoom(roomId, excludeParticipantId, message) {
-    let sentCount = 0;
     for (const [connId, conn] of connections.entries()) {
         if (conn.roomId === roomId && conn.participantId !== excludeParticipantId) {
             if (conn.ws.readyState === 1) {
                 conn.ws.send(JSON.stringify(message));
-                sentCount++;
             }
         }
-    }
-    if (sentCount > 0) {
-        console.log(`📢 ${message.action} → ${sentCount} participants`);
     }
 }
 
@@ -557,7 +476,6 @@ function cleanupConnection(connectionId, roomId) {
         });
 
         connections.delete(connectionId);
-        console.log(`🧹 Connexion nettoyée: ${connectionId}`);
     }
 }
 
@@ -566,10 +484,11 @@ function cleanupConnection(connectionId, roomId) {
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
-        service: 'VisioCampus Mediasoup SFU',
-        version: '3.1.0',
+        service: 'VisioCampus Mediasoup SFU - TCP Only',
+        version: '3.2.0',
         timestamp: new Date().toISOString(),
         publicIp: cachedPublicIp,
+        transport: 'TCP only (Render compatible)',
         iceServers: ICE_SERVERS
     });
 });
@@ -580,8 +499,7 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         rooms: rooms.size,
         connections: connections.size,
-        publicIp: cachedPublicIp,
-        iceServers: ICE_SERVERS
+        publicIp: cachedPublicIp
     });
 });
 
@@ -667,8 +585,6 @@ wss.on('connection', (ws, request) => {
     const roomId = url.searchParams.get('roomId');
     const participantId = url.searchParams.get('participantId');
 
-    console.log(`✅ WebSocket: Room=${roomId}, Participant=${participantId}`);
-
     if (!roomId || !participantId || !rooms.has(roomId)) {
         ws.send(JSON.stringify({ action: 'error', error: 'Paramètres invalides' }));
         ws.close();
@@ -681,25 +597,23 @@ wss.on('connection', (ws, request) => {
 // ==================== DÉMARRAGE ====================
 async function startServer() {
     try {
-        // ✅ IMPORTANT : Résoudre l'IP AVANT de créer le worker
-        console.log('🔍 Résolution de l\'IP publique...');
+        console.log('🔍 Résolution IP publique...');
         await getPublicIp();
-        console.log(`✅ IP publique configurée: ${cachedPublicIp}`);
+        console.log(`✅ IP: ${cachedPublicIp}`);
 
         await createWorker();
 
         const PORT = process.env.PORT || 3001;
-        const HOST = '0.0.0.0';
 
-        server.listen(PORT, HOST, () => {
-            console.log('='.repeat(80));
-            console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - VERSION CORRIGÉE');
+        server.listen(PORT, '0.0.0.0', () => {
+            console.log('\n' + '='.repeat(80));
+            console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - TCP ONLY (RENDER)');
             console.log('='.repeat(80));
             console.log(`📡 Port: ${PORT}`);
             console.log(`🌐 IP publique: ${cachedPublicIp}`);
-            console.log(`🎯 STUN: ${ICE_SERVERS[0].urls.length} serveurs`);
-            console.log(`🎯 TURN: openrelay.metered.ca`);
-            console.log('='.repeat(80));
+            console.log(`⚠️  Transport: TCP UNIQUEMENT (UDP désactivé)`);
+            console.log(`🎯 TURN: openrelay.metered.ca:443`);
+            console.log('='.repeat(80) + '\n');
         });
     } catch (error) {
         console.error('❌ Erreur démarrage:', error);
@@ -709,26 +623,13 @@ async function startServer() {
 
 // ==================== SHUTDOWN ====================
 const gracefulShutdown = async () => {
-    console.log('\n🛑 Arrêt du serveur...');
-
-    for (const [id, connection] of connections.entries()) {
-        try {
-            connection.ws.close();
-        } catch (error) {}
-    }
-
+    console.log('\n🛑 Arrêt...');
     if (worker) worker.close();
-
-    server.close(() => {
-        console.log('✅ Serveur fermé');
-        process.exit(0);
-    });
-
+    server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), 10000);
 };
 
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
-// Démarrer
 startServer();
