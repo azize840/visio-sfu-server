@@ -34,6 +34,34 @@ const wss = new WebSocketServer({
     }
 });
 
+// ==================== CONFIGURATION STUN/TURN (AJOUTÉ) ====================
+const ICE_SERVERS = [
+    {
+        urls: [
+            'stun:stun.l.google.com:19302',
+            'stun:stun1.l.google.com:19302',
+            'stun:stun2.l.google.com:19302',
+            'stun:stun3.l.google.com:19302',
+            'stun:stun4.l.google.com:19302'
+        ]
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    }
+];
+
 // ==================== CONFIGURATION MEDIASOUP ====================
 const mediaCodecs = [
     {
@@ -55,12 +83,34 @@ const mediaCodecs = [
             'x-google-max-bitrate': 3000,
             'x-google-min-bitrate': 400
         }
+    },
+    {
+        kind: 'video',
+        mimeType: 'video/H264',
+        clockRate: 90000,
+        parameters: {
+            'packetization-mode': 1,
+            'profile-level-id': '42e01f',
+            'level-asymmetry-allowed': 1
+        }
     }
 ];
 
 let worker;
 let rooms = new Map();
 const connections = new Map();
+
+// ==================== FONCTION POUR OBTENIR L'IP PUBLIQUE ====================
+async function getPublicIp() {
+    // Pour Render, utiliser l'hostname externe
+    if (process.env.RENDER_EXTERNAL_HOSTNAME) {
+        console.log(`🌐 Utilisation IP Render: ${process.env.RENDER_EXTERNAL_HOSTNAME}`);
+        return process.env.RENDER_EXTERNAL_HOSTNAME;
+    }
+
+    // Fallback pour localhost
+    return '127.0.0.1';
+}
 
 // ==================== CRÉATION DU WORKER MEDIASOUP ====================
 async function createWorker() {
@@ -134,16 +184,16 @@ async function handleMediasoupClient(ws, roomId, participantId) {
         cleanupConnection(connectionId, roomId);
     });
 
-    // Envoyer les capacités RTP
+    // Envoyer les capacités RTP avec ICE servers
     ws.send(JSON.stringify({
         action: 'rtp-capabilities',
-        rtpCapabilities: room.router.rtpCapabilities
+        rtpCapabilities: room.router.rtpCapabilities,
+        iceServers: ICE_SERVERS // ✅ AJOUTÉ
     }));
 }
 
 async function handleMediasoupMessage(connection, data) {
     const { action } = data;
-    const { ws, router, transports, producers } = connection;
 
     switch (action) {
         case 'create-transport':
@@ -172,52 +222,76 @@ async function handleMediasoupMessage(connection, data) {
 
         default:
             console.warn('⚠️ Action inconnue:', action);
-            ws.send(JSON.stringify({
+            connection.ws.send(JSON.stringify({
                 action: 'error',
                 error: `Action inconnue: ${action}`
             }));
     }
 }
 
+// ✅ CORRECTION MAJEURE : Création transport avec IP publique et STUN/TURN
 async function handleCreateTransport(connection, data) {
     const { ws, router, transports, participantId } = connection;
     const { direction } = data;
+
+    // Obtenir l'IP publique pour Render
+    const announcedIp = await getPublicIp();
+
+    console.log(`🌐 Création transport avec announcedIp: ${announcedIp}`);
 
     const transport = await router.createWebRtcTransport({
         listenIps: [
             {
                 ip: '0.0.0.0',
-                announcedIp: process.env.RENDER_EXTERNAL_HOSTNAME || '127.0.0.1'
+                announcedIp: announcedIp // ✅ CORRECTION : IP publique
             }
         ],
         enableUdp: true,
         enableTcp: true,
         preferUdp: true,
-        initialAvailableOutgoingBitrate: 1000000
+        initialAvailableOutgoingBitrate: 1000000,
+        minimumAvailableOutgoingBitrate: 600000,
+        maxSctpMessageSize: 262144,
+        // ✅ AJOUTÉ : Configuration ICE explicite
+        iceConsentTimeout: 20,
+        enableSctp: true
     });
 
     transports.set(transport.id, transport);
 
+    // Gestion des événements du transport
     transport.on('dtlsstatechange', (dtlsState) => {
-        if (dtlsState === 'closed') {
+        console.log(`🔐 DTLS State changed: ${dtlsState} pour transport ${transport.id}`);
+        if (dtlsState === 'closed' || dtlsState === 'failed') {
+            console.error(`❌ Transport ${transport.id} fermé/échoué: ${dtlsState}`);
             transport.close();
         }
     });
 
+    transport.on('icestatechange', (iceState) => {
+        console.log(`🧊 ICE State changed: ${iceState} pour transport ${transport.id}`);
+        if (iceState === 'disconnected' || iceState === 'closed') {
+            console.warn(`⚠️ ICE ${iceState} pour transport ${transport.id}`);
+        }
+    });
+
     transport.on('close', () => {
+        console.log(`🚗 Transport fermé: ${transport.id}`);
         transports.delete(transport.id);
     });
 
+    // ✅ CORRECTION : Envoyer aussi les ICE servers au client
     ws.send(JSON.stringify({
         action: 'transport-created',
         id: transport.id,
         iceParameters: transport.iceParameters,
         iceCandidates: transport.iceCandidates,
         dtlsParameters: transport.dtlsParameters,
-        direction: direction
+        direction: direction,
+        iceServers: ICE_SERVERS // ✅ AJOUTÉ : Envoyer les ICE servers
     }));
 
-    console.log(`✅ Transport créé: ${transport.id} pour ${participantId} (${direction})`);
+    console.log(`✅ Transport créé: ${transport.id} pour ${participantId} (${direction}) avec ${transport.iceCandidates.length} ICE candidates`);
 }
 
 async function handleConnectTransport(connection, data) {
@@ -234,15 +308,20 @@ async function handleConnectTransport(connection, data) {
 }
 
 async function handleProduce(connection, data) {
-    const { ws, transports, producers, router, participantId, roomId } = connection;
-    const { transportId, kind, rtpParameters } = data;
+    const { ws, transports, producers, participantId, roomId } = connection;
+    const { transportId, kind, rtpParameters, appData } = data;
 
     const transport = transports.get(transportId);
     if (!transport) {
         throw new Error(`Transport non trouvé: ${transportId}`);
     }
 
-    const producer = await transport.produce({ kind, rtpParameters });
+    const producer = await transport.produce({
+        kind,
+        rtpParameters,
+        appData: appData || {}
+    });
+
     producers.set(producer.id, producer);
 
     // Notifier tous les autres participants dans la room
@@ -262,6 +341,7 @@ async function handleProduce(connection, data) {
     console.log(`✅ Producer créé: ${producer.id} (${kind}) pour ${participantId}`);
 
     producer.on('transportclose', () => {
+        console.log(`🚗 Transport fermé pour producer: ${producer.id}`);
         producer.close();
         producers.delete(producer.id);
     });
@@ -273,6 +353,11 @@ async function handleProduce(connection, data) {
             participantId: participantId,
             producerId: producer.id
         });
+    });
+
+    // Gestion du score (qualité)
+    producer.on('score', (score) => {
+        console.log(`📊 Score producer ${producer.id}:`, score);
     });
 }
 
@@ -291,16 +376,17 @@ async function handleConsume(connection, data) {
             throw new Error(`Transport non trouvé: ${transportId}`);
         }
 
-        // ✅ CORRECTION : Créer le consumer avec gestion d'erreur
+        // Créer le consumer avec gestion d'erreur
         const consumer = await transport.consume({
             producerId,
             rtpCapabilities,
-            paused: false
+            paused: false,
+            appData: { participantId: data.participantId || 'unknown' }
         });
 
         consumers.set(consumer.id, consumer);
 
-        // ✅ CORRECTION : Vérifier que la track existe avant d'y accéder
+        // Vérifier que la track existe
         let trackInfo = null;
         if (consumer.track) {
             trackInfo = {
@@ -312,7 +398,7 @@ async function handleConsume(connection, data) {
                 label: consumer.track.label || `remote-${consumer.kind}`
             };
 
-            // ✅ Gestion des événements de track
+            // Gestion des événements de track
             consumer.track.onmute = () => {
                 console.log(`🔇 Track ${consumer.track.id} muted`);
                 ws.send(JSON.stringify({
@@ -351,7 +437,7 @@ async function handleConsume(connection, data) {
             };
         }
 
-        // ✅ CORRECTION : Trouver le participantId du producteur
+        // Trouver le participantId du producteur
         const producerParticipantId = getParticipantIdFromProducer(producerId);
 
         ws.send(JSON.stringify({
@@ -367,7 +453,7 @@ async function handleConsume(connection, data) {
 
         console.log(`✅ Consumer créé: ${consumer.id} pour ${participantId}, producteur: ${producerId}`);
 
-        // ✅ Gestion des événements du consumer
+        // Gestion des événements du consumer
         consumer.on('transportclose', () => {
             console.log(`🚗 Transport fermé pour consumer: ${consumer.id}`);
             consumer.close();
@@ -385,7 +471,11 @@ async function handleConsume(connection, data) {
             consumers.delete(consumer.id);
         });
 
-        // ✅ Résumer le consumer si nécessaire
+        consumer.on('score', (score) => {
+            console.log(`📊 Score consumer ${consumer.id}:`, score);
+        });
+
+        // Résumer le consumer si nécessaire
         try {
             if (consumer.paused) {
                 await consumer.resume();
@@ -404,7 +494,6 @@ async function handleConsume(connection, data) {
     }
 }
 
-// ✅ CORRECTION : Méthode pour trouver le participantId à partir du producerId
 function getParticipantIdFromProducer(producerId) {
     for (const [connectionId, connection] of connections.entries()) {
         if (connection.producers.has(producerId)) {
@@ -412,7 +501,6 @@ function getParticipantIdFromProducer(producerId) {
         }
     }
 
-    // Si on ne trouve pas, essayer d'extraire de l'ID
     const match = producerId.match(/\d+/);
     return match ? match[0] : 'unknown';
 }
@@ -443,7 +531,6 @@ async function handleGetProducers(connection, data) {
         throw new Error('Room non trouvée');
     }
 
-    // Récupérer tous les producers de la room (sauf ceux du participant actuel)
     const allProducers = [];
     for (const [connId, conn] of connections.entries()) {
         if (conn.roomId === roomId && conn.participantId !== participantId) {
@@ -475,7 +562,9 @@ function broadcastToRoom(roomId, excludeParticipantId, message) {
             }
         }
     }
-    console.log(`📢 Message ${message.action} diffusé à ${sentCount} participants`);
+    if (sentCount > 0) {
+        console.log(`📢 Message ${message.action} diffusé à ${sentCount} participants`);
+    }
 }
 
 function cleanupConnection(connectionId, roomId) {
@@ -509,18 +598,19 @@ function cleanupConnection(connectionId, roomId) {
 app.get('/', (req, res) => {
     res.json({
         status: 'SFU Server Running',
-        service: 'VisioCampus Mediasoup SFU - CORRIGÉ V2',
+        service: 'VisioCampus Mediasoup SFU - STUN/TURN Fixed',
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'development',
-        version: '2.1.0',
-        features: ['audio', 'video', 'real-time', 'tracks-fixed-v2'],
+        version: '3.0.0',
+        features: ['audio', 'video', 'real-time', 'STUN/TURN', 'ICE-fixed'],
         routes: {
             health: '/health',
             network: '/network-info',
             create_room: 'POST /rooms',
             create_token: 'POST /tokens',
             websocket: '/ws'
-        }
+        },
+        iceServers: ICE_SERVERS
     });
 });
 
@@ -534,13 +624,14 @@ app.get('/health', (req, res) => {
 
     res.json({
         status: 'ok',
-        server: 'VisioCampus Mediasoup SFU - Render (CORRIGÉ V2)',
+        server: 'VisioCampus Mediasoup SFU - STUN/TURN Enabled',
         environment: process.env.NODE_ENV || 'development',
         timestamp: new Date().toISOString(),
         rooms_count: rooms.size,
         connections_count: connections.size,
         room_stats: roomStats,
-        worker: worker ? 'active' : 'inactive'
+        worker: worker ? 'active' : 'inactive',
+        iceServers: ICE_SERVERS
     });
 });
 
@@ -552,15 +643,7 @@ app.get('/network-info', (req, res) => {
         websocket_url: serverUrl.replace('http', 'ws') + '/ws',
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'development',
-        ice_servers: [
-            {
-                urls: [
-                    'stun:stun.l.google.com:19302',
-                    'stun:stun1.l.google.com:19302',
-                    'stun:stun2.l.google.com:19302'
-                ]
-            }
-        ]
+        ice_servers: ICE_SERVERS
     });
 });
 
@@ -657,15 +740,7 @@ app.post('/tokens', async (req, res) => {
             participant_id,
             rtp_capabilities: rtpCapabilities,
             server_url: websocketUrl,
-            ice_servers: [
-                {
-                    urls: [
-                        'stun:stun.l.google.com:19302',
-                        'stun:stun1.l.google.com:19302',
-                        'stun:stun2.l.google.com:19302'
-                    ]
-                }
-            ],
+            ice_servers: ICE_SERVERS, // ✅ AJOUTÉ
             max_participants: room.maxParticipants,
             current_participants: participantsCount
         });
@@ -795,7 +870,7 @@ async function startServer() {
 
         server.listen(PORT, HOST, () => {
             console.log('='.repeat(80));
-            console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - RENDER (CORRIGÉ V2)');
+            console.log('🚀 VISIOCAMPUS MEDIASOUP SFU - STUN/TURN ENABLED');
             console.log('='.repeat(80));
             console.log(`📡 Port: ${PORT}`);
             console.log(`🖥️  Host: ${HOST}`);
@@ -803,12 +878,14 @@ async function startServer() {
             console.log(`⚡ WebSocket: ws://${HOST}:${PORT}/ws`);
             console.log('='.repeat(80));
             console.log('🎯 CORRECTIONS APPLIQUÉES:');
-            console.log(`   ✅ Gestion robuste des tracks (évite l'erreur undefined)`);
-            console.log(`   ✅ Vérification existence track avant accès`);
-            console.log(`   ✅ Gestion d'erreur améliorée dans handleConsume`);
-            console.log(`   ✅ Tracks virtuelles si track réelle non disponible`);
+            console.log(`   ✅ STUN servers: ${ICE_SERVERS[0].urls.length} serveurs Google`);
+            console.log(`   ✅ TURN servers: openrelay.metered.ca (ports 80, 443, TCP)`);
+            console.log(`   ✅ IP publique annoncée: ${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`);
+            console.log(`   ✅ ICE servers envoyés aux clients`);
+            console.log(`   ✅ Gestion robuste des tracks`);
+            console.log(`   ✅ Événements ICE/DTLS monitorés`);
             console.log('='.repeat(80));
-            console.log(`✅ Serveur Mediasoup PRÊT - Plus d'erreur "Cannot read properties of undefined"`);
+            console.log(`✅ Serveur Mediasoup PRÊT - ICE/NAT Traversal configuré`);
             console.log(`🔗 URL: https://visio-sfu-server-6.onrender.com`);
             console.log('='.repeat(80));
         });
